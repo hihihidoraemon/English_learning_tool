@@ -50,48 +50,71 @@ def resolve_bilibili_short_url(short_url):
         return short_url
 
 def download_bilibili_audio(url):
-    """下载B站视频音频（修复版：移除不支持的-v参数）"""
+    """下载B站视频音频（修复版：强制下载最低清流，绕过登录限制）"""
     clean_audio_dir()
     try:
         # 第一步：解析短链接为完整B站链接
         full_url = resolve_bilibili_short_url(url)
         st.info(f"解析后的完整链接：{full_url}")
         
-        # 第二步：用you-get下载音频（移除了-v参数）
-        command = f"you-get -o audio --format=flac {full_url}"
-        # 执行命令并捕获输出
-        result = subprocess.run(
-            command,
+        # 第二步：用you-get下载，强制选择最低清的流（通常无需登录）
+        # 使用 --json 选项获取所有可用流，然后选择第一个（最低清）
+        list_command = f"you-get --json {full_url}"
+        list_result = subprocess.run(
+            list_command,
             shell=True,
             capture_output=True,
             text=True,
-            timeout=120  # 延长超时时间到2分钟
+            timeout=60
+        )
+        
+        if list_result.returncode != 0:
+            return None, f"获取视频信息失败：{list_result.stderr}"
+        
+        # 解析JSON，找到最低清的流ID
+        import json
+        video_info = json.loads(list_result.stdout)
+        streams = video_info.get('streams', {})
+        # 按质量从低到高排序，选择第一个
+        sorted_streams = sorted(streams.items(), key=lambda x: x[1].get('quality', 9999))
+        if not sorted_streams:
+            return None, "未找到任何可用的视频流"
+        lowest_quality_stream_id = sorted_streams[0][0]
+        st.info(f"自动选择最低清流：{lowest_quality_stream_id}")
+
+        # 第三步：下载这个最低清流
+        download_command = f"you-get -o audio --format={lowest_quality_stream_id} {full_url}"
+        download_result = subprocess.run(
+            download_command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=120
         )
         
         # 打印日志（方便排查）
         st.text("下载日志：")
-        st.text(result.stdout)
-        if result.stderr:
+        st.text(download_result.stdout)
+        if download_result.stderr:
             st.text("下载错误日志：")
-            st.text(result.stderr)
+            st.text(download_result.stderr)
         
-        # 第三步：查找所有音频文件（扩展格式列表，兼容更多情况）
-        audio_extensions = ('.mp3', '.m4a', '.wav', '.flac', '.ogg', '.aac')
-        audio_files = []
-        # 递归查找audio目录下的所有音频文件（包括子目录）
+        # 第四步：查找所有音频/视频文件
+        media_extensions = ('.mp4', '.flv', '.mkv', '.webm', '.mp3', '.m4a', '.wav', '.flac', '.ogg', '.aac')
+        media_files = []
         for root, dirs, files in os.walk("audio"):
             for file in files:
-                if file.lower().endswith(audio_extensions):
-                    audio_files.append(os.path.join(root, file))
+                if file.lower().endswith(media_extensions):
+                    media_files.append(os.path.join(root, file))
         
-        if audio_files:
-            audio_path = audio_files[-1]  # 取最后一个找到的音频文件
-            st.success(f"成功找到音频文件：{audio_path}")
-            return audio_path, None
+        if media_files:
+            media_path = media_files[-1]
+            st.success(f"成功找到媒体文件：{media_path}")
+            return media_path, None
         else:
-            return None, "未找到音频文件！可能原因：1.视频无音频 2.you-get未正确下载 3.链接权限问题"
+            return None, "未找到媒体文件！可能原因：1.视频无音频 2.you-get未正确下载 3.链接权限问题"
     except subprocess.TimeoutExpired:
-        return None, "音频下载超时（超过2分钟），请检查网络或视频链接"
+        return None, "操作超时，请检查网络或视频链接"
     except Exception as e:
         return None, f"下载失败：{str(e)}"
 
