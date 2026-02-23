@@ -50,16 +50,15 @@ def resolve_bilibili_short_url(short_url):
         return short_url
 
 def download_bilibili_audio(url):
-    """下载B站视频音频（优化版：适配短链接+强制指定音频格式）"""
+    """下载B站视频音频（修复版：移除不支持的-v参数）"""
     clean_audio_dir()
     try:
         # 第一步：解析短链接为完整B站链接
         full_url = resolve_bilibili_short_url(url)
         st.info(f"解析后的完整链接：{full_url}")
         
-        # 第二步：用you-get下载音频（强制指定格式，输出详细日志）
-        # --format 选择音频格式，-v 显示详细日志，方便排查
-        command = f"you-get -o audio --format=flac -v {full_url}"
+        # 第二步：用you-get下载音频（移除了-v参数）
+        command = f"you-get -o audio --format=flac {full_url}"
         # 执行命令并捕获输出
         result = subprocess.run(
             command,
