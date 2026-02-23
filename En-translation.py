@@ -1,25 +1,20 @@
 import re
 import requests
-import json
-import os
-import whisper
 import streamlit as st
-from pathlib import Path
-import shutil
-import subprocess
 import urllib.parse
+import json
 
-# 设置页面配置
+# 设置页面配置（适配手机）
 st.set_page_config(
     page_title="B站英文视频单词提取工具",
     page_icon="📝",
-    layout="wide"
+    layout="centered",  # 手机适配：居中布局
+    initial_sidebar_state="collapsed"  # 默认收起侧边栏，适配手机
 )
 
 # ----------------------
 # 配置项
 # ----------------------
-# 简单词列表（可自行修改）
 SIMPLE_WORDS = {"a", "an", "the", "and", "or", "but", "is", "are", "am", "was", "were", 
                 "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", 
                 "them", "in", "on", "at", "to", "for", "of", "with", "by", "from", "as",
@@ -28,140 +23,117 @@ SIMPLE_WORDS = {"a", "an", "the", "and", "or", "but", "is", "are", "am", "was", 
                 "may", "might", "shall", "should", "must", "so", "too", "very", "just", "only"}
 
 # ----------------------
-# 工具函数
+# 核心工具函数（纯云端API）
 # ----------------------
-def clean_audio_dir():
-    """清理音频目录"""
-    if os.path.exists("audio"):
-        shutil.rmtree("audio")
-    os.makedirs("audio", exist_ok=True)
-
 def resolve_bilibili_short_url(short_url):
-    """解析B站短链接（b23.tv）为完整链接"""
+    """解析B站短链接"""
     try:
-        # 处理b23.tv短链接
         if "b23.tv" in short_url:
-            # 禁止重定向，获取真实链接
             response = requests.head(short_url, allow_redirects=True, timeout=10)
             return response.url
         return short_url
     except Exception as e:
-        st.warning(f"解析短链接失败，将尝试直接使用原链接：{str(e)}")
+        st.warning(f"解析短链接失败：{str(e)}")
         return short_url
 
-def download_bilibili_audio(url):
-    """下载B站视频音频（修复版：强制下载最低清流，绕过登录限制）"""
-    clean_audio_dir()
+def get_bilibili_audio_url(video_url):
+    """解析B站视频音频链接（纯API，无需下载）"""
     try:
-        # 第一步：解析短链接为完整B站链接
-        full_url = resolve_bilibili_short_url(url)
-        st.info(f"解析后的完整链接：{full_url}")
+        # 提取BV号
+        bv_match = re.search(r"BV(\w+)", video_url)
+        if not bv_match:
+            return None, "未找到BV号，请检查链接格式"
+        bv_id = bv_match.group(0)
         
-        # 第二步：用you-get下载，强制选择最低清的流（通常无需登录）
-        # 使用 --json 选项获取所有可用流，然后选择第一个（最低清）
-        list_command = f"you-get --json {full_url}"
-        list_result = subprocess.run(
-            list_command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
+        # B站公开API解析音频（无需登录）
+        api_url = f"https://api.bilibili.com/x/player/playurl?bvid={bv_id}&cid=0&qn=16&fnval=16&fnver=0"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Mobile; Android 13; Pixel 7) AppleWebKit/537.36"
+        }
+        res = requests.get(api_url, headers=headers, timeout=10)
+        data = res.json()
         
-        if list_result.returncode != 0:
-            return None, f"获取视频信息失败：{list_result.stderr}"
+        if data.get("code") != 0:
+            return None, f"B站API返回错误：{data.get('message', '未知错误')}"
         
-        # 解析JSON，找到最低清的流ID
-        import json
-        video_info = json.loads(list_result.stdout)
-        streams = video_info.get('streams', {})
-        # 按质量从低到高排序，选择第一个
-        sorted_streams = sorted(streams.items(), key=lambda x: x[1].get('quality', 9999))
-        if not sorted_streams:
-            return None, "未找到任何可用的视频流"
-        lowest_quality_stream_id = sorted_streams[0][0]
-        st.info(f"自动选择最低清流：{lowest_quality_stream_id}")
-
-        # 第三步：下载这个最低清流
-        download_command = f"you-get -o audio --format={lowest_quality_stream_id} {full_url}"
-        download_result = subprocess.run(
-            download_command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=120
-        )
+        # 提取音频URL
+        dash = data.get("data", {}).get("dash", {})
+        audio_streams = dash.get("audio", [])
+        if not audio_streams:
+            return None, "该视频无独立音频流，无法提取"
         
-        # 打印日志（方便排查）
-        st.text("下载日志：")
-        st.text(download_result.stdout)
-        if download_result.stderr:
-            st.text("下载错误日志：")
-            st.text(download_result.stderr)
-        
-        # 第四步：查找所有音频/视频文件
-        media_extensions = ('.mp4', '.flv', '.mkv', '.webm', '.mp3', '.m4a', '.wav', '.flac', '.ogg', '.aac')
-        media_files = []
-        for root, dirs, files in os.walk("audio"):
-            for file in files:
-                if file.lower().endswith(media_extensions):
-                    media_files.append(os.path.join(root, file))
-        
-        if media_files:
-            media_path = media_files[-1]
-            st.success(f"成功找到媒体文件：{media_path}")
-            return media_path, None
-        else:
-            return None, "未找到媒体文件！可能原因：1.视频无音频 2.you-get未正确下载 3.链接权限问题"
-    except subprocess.TimeoutExpired:
-        return None, "操作超时，请检查网络或视频链接"
+        audio_url = audio_streams[0].get("baseUrl")
+        # 补全音频URL的请求头（B站防盗链）
+        audio_headers = {
+            "User-Agent": headers["User-Agent"],
+            "Referer": "https://www.bilibili.com/"
+        }
+        return (audio_url, audio_headers), None
     except Exception as e:
-        return None, f"下载失败：{str(e)}"
+        return None, f"解析音频链接失败：{str(e)}"
 
-def audio_to_text(audio_path, model_name="base"):
-    """音频转文字"""
+def audio_url_to_text(audio_info):
+    """云端语音转文字（使用免费API，替代Whisper+ffmpeg）"""
+    audio_url, audio_headers = audio_info
     try:
-        model = whisper.load_model(model_name)
-        result = model.transcribe(audio_path, language="en")
-        return result["text"], None
+        # 方案：使用OpenAI Whisper API（需自己申请API Key，免费额度够用）
+        # 替换为你自己的OpenAI API Key（https://platform.openai.com/）
+        OPENAI_API_KEY = st.secrets.get("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", "")
+        if not OPENAI_API_KEY:
+            st.warning("请先配置OpenAI API Key！")
+            return None, "缺少OpenAI API Key"
+        
+        # 下载音频数据（临时）
+        audio_res = requests.get(audio_url, headers=audio_headers, timeout=30)
+        audio_res.raise_for_status()
+        
+        # 调用Whisper API转文字
+        url = "https://api.openai.com/v1/audio/transcriptions"
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+        files = {
+            "file": ("audio.mp3", audio_res.content, "audio/mpeg"),
+            "model": (None, "whisper-1"),
+            "language": (None, "en")
+        }
+        res = requests.post(url, headers=headers, files=files, timeout=60)
+        if res.status_code != 200:
+            return None, f"转写失败：{res.text}"
+        
+        text = res.json().get("text", "")
+        return text, None
     except Exception as e:
-        return None, f"转写失败：{str(e)}"
+        return None, f"云端转写失败：{str(e)}"
 
 def translate_text_to_zh(text):
-    """调用免费翻译API将英文翻译成中文"""
+    """云端翻译（纯Web API）"""
     try:
-        # 备用免费翻译接口（无需API Key）
-        url = f"https://fanyi.youdao.com/translate?&doctype=json&type=EN2ZH_CN&i={urllib.parse.quote(text)}"
+        text_encoded = urllib.parse.quote(text)
+        url = f"https://fanyi.youdao.com/translate?doctype=json&type=EN2ZH_CN&i={text_encoded}"
         res = requests.get(url, timeout=10)
         if res.status_code == 200:
             translations = res.json()["translateResult"][0]
             zh_text = "".join([t["tgt"] for t in translations])
             return zh_text, None
-        
         return "", "翻译接口调用失败"
     except Exception as e:
         return "", f"翻译出错：{str(e)}"
 
 def extract_unique_words(text, filter_simple=True):
-    """提取去重单词，可选过滤简单词"""
-    # 提取英文单词并转小写
+    """提取去重单词"""
     words = re.findall(r"[a-zA-Z]+", text.lower())
     unique_words = sorted(list(set(words)))
-    
-    # 过滤简单词
     if filter_simple:
         unique_words = [word for word in unique_words if word not in SIMPLE_WORDS and len(word) > 1]
-    
     return unique_words
 
 def get_word_definition(word):
-    """调用词典API获取释义（包含音标）"""
+    """词典API（纯Web）"""
     try:
         url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
         res = requests.get(url, timeout=5)
         if res.status_code == 200:
             data = res.json()[0]
-            # 提取音标（优先英式，没有则取美式）
+            # 提取音标
             phonetics = data.get("phonetics", [])
             phonetic = ""
             for p in phonetics:
@@ -170,156 +142,132 @@ def get_word_definition(word):
                     break
                 elif p.get("text"):
                     phonetic = p["text"]
-            
-            # 提取核心释义
+            # 提取释义
             meanings = data.get("meanings", [])
             if meanings:
-                # 取第一个词性的第一个释义
                 pos = meanings[0]["partOfSpeech"]
                 definition = meanings[0]["definitions"][0]["definition"]
-                # 提取例句（如果有）
                 example = meanings[0]["definitions"][0].get("example", "")
-                if example:
-                    return {
-                        "phonetic": phonetic,
-                        "definition": f"【{pos}】{definition}",
-                        "example": f"例句：{example}"
-                    }
-                else:
-                    return {
-                        "phonetic": phonetic,
-                        "definition": f"【{pos}】{definition}",
-                        "example": ""
-                    }
+                return {
+                    "phonetic": phonetic,
+                    "definition": f"【{pos}】{definition}",
+                    "example": f"例句：{example}" if example else ""
+                }
             else:
                 return {"phonetic": "", "definition": "无可用释义", "example": ""}
         else:
-            return {"phonetic": "", "definition": "查询失败（API返回错误）", "example": ""}
+            return {"phonetic": "", "definition": "查询失败", "example": ""}
     except Exception as e:
         return {"phonetic": "", "definition": f"查询出错：{str(e)}", "example": ""}
 
-def export_words_to_txt(words_with_def):
-    """导出单词和释义到TXT"""
-    content = ""
-    for word, desc in words_with_def.items():
-        content += f"{word} {desc['phonetic']}\n{desc['definition']}\n{desc['example']}\n{'-'*50}\n"
-    return content
-
-# ----------------------
-# 播放读音的JS函数
-# ----------------------
 def play_pronunciation_js(word):
-    """生成播放单词读音的JavaScript代码"""
+    """播放读音（浏览器原生API，手机兼容）"""
     return f"""
     <script>
-    // 创建语音合成对象
     const synth = window.speechSynthesis;
-    // 创建语音内容
     const utterance = new SpeechSynthesisUtterance("{word}");
-    // 设置为英式英语（也可改为'en-US'美式）
     utterance.lang = 'en-GB';
-    // 播放语音
-    synth.speak(utterance);
+    // 手机兼容：延迟播放
+    setTimeout(() => synth.speak(utterance), 100);
     </script>
     """
 
 # ----------------------
-# 页面UI
+# 页面UI（适配手机）
 # ----------------------
-st.title("📝 B站英文视频单词提取工具")
-st.divider()
+st.title("📝 B站英文单词提取")
+st.caption("手机端适配版 | 无需安装任何软件")
 
-# 左侧输入区
-with st.sidebar:
-    st.header("输入设置")
-    video_url = st.text_input("B站视频链接", placeholder="例如：https://www.bilibili.com/video/BV1xx411c7mG/ 或 b23.tv/TyCfrFJ")
-    filter_simple = st.checkbox("过滤简单基础词（a/the/and等）", value=True)
-    model_option = st.selectbox("语音识别模型（越大越准）", ["base", "small", "medium"], index=0)
-    translate_switch = st.checkbox("翻译视频文本为中文", value=True)  # 翻译开关
-    submit_btn = st.button("开始提取", type="primary", use_container_width=True)
+# 输入区（手机友好）
+video_url = st.text_input(
+    "B站视频链接",
+    placeholder="粘贴b23.tv或BV开头链接",
+    label_visibility="collapsed"
+)
+col1, col2 = st.columns(2)
+with col1:
+    filter_simple = st.checkbox("过滤简单词", value=True)
+with col2:
+    translate_switch = st.checkbox("翻译为中文", value=True)
 
-# 右侧结果区
-# 调整列布局：原文+翻译 占2/3，单词区占1/3
-col_text, col_words = st.columns([2, 1])
+submit_btn = st.button("开始提取", type="primary", use_container_width=True)
 
+# 核心逻辑
 if submit_btn and video_url:
-    with st.spinner("正在下载音频..."):
-        audio_path, error = download_bilibili_audio(video_url)
+    with st.spinner("解析视频链接..."):
+        # 1. 解析短链接
+        full_url = resolve_bilibili_short_url(video_url)
+        # 2. 解析音频链接
+        audio_info, error = get_bilibili_audio_url(full_url)
         if error:
             st.error(error)
             st.stop()
     
-    with st.spinner("正在转换语音为文字..."):
-        text, error = audio_to_text(audio_path, model_option)
+    with st.spinner("语音转文字中..."):
+        # 3. 云端转写
+        text, error = audio_url_to_text(audio_info)
         if error:
             st.error(error)
             st.stop()
+        if not text:
+            st.warning("未识别到任何文本")
+            st.stop()
     
-    # 翻译文本（如果开启开关）
+    # 4. 翻译（可选）
     zh_text = ""
     if translate_switch:
-        with st.spinner("正在翻译文本为中文..."):
+        with st.spinner("翻译中..."):
             zh_text, error = translate_text_to_zh(text)
             if error:
                 st.warning(f"翻译提示：{error}")
     
-    with st.spinner("正在提取单词并查询释义..."):
+    # 5. 提取单词
+    with st.spinner("提取单词..."):
         unique_words = extract_unique_words(text, filter_simple)
-        # 构建单词-释义字典
-        words_dict = {}
-        for word in unique_words:
-            words_dict[word] = get_word_definition(word)
+        words_dict = {word: get_word_definition(word) for word in unique_words}
     
-    # 显示结果：原文+翻译
-    with col_text:
-        st.subheader("📄 视频语音文本")
-        # 切换标签：英文原文 / 中文翻译
-        tab1, tab2 = st.tabs(["🇬🇧 英文原文", "🇨🇳 中文翻译"])
+    # 显示结果（手机适配）
+    st.divider()
+    # 文本区（折叠面板，节省空间）
+    with st.expander("📄 视频文本", expanded=True):
+        tab1, tab2 = st.tabs(["🇬🇧 英文", "🇨🇳 中文"])
         with tab1:
-            st.text_area("", text, height=400)
+            st.text_area("", text, height=150)  # 缩短高度，适配手机
         with tab2:
-            if zh_text:
-                st.text_area("", zh_text, height=400)
-            else:
-                st.info("暂无翻译结果，请检查网络或翻译接口")
+            st.text_area("", zh_text if zh_text else "无翻译结果", height=150)
     
-    # 显示单词区
-    with col_words:
-        st.subheader(f"📚 提取的单词（共{len(unique_words)}个）")
-        # 显示单词+读音按钮+音标+释义
+    # 单词区（滚动显示）
+    st.subheader(f"📚 单词列表（{len(unique_words)}个）")
+    for word, desc in words_dict.items():
+        # 手机适配：一行显示
+        col_word, col_btn = st.columns([3, 1])
+        with col_word:
+            st.markdown(f"**{word}** {f'/ {desc["phonetic"]} /' if desc['phonetic'] else ''}")
+        with col_btn:
+            if st.button("🔊", key=word, use_container_width=True):
+                st.components.v1.html(play_pronunciation_js(word), height=0)
+        st.write(desc["definition"])
+        if desc["example"]:
+            st.caption(desc["example"])
+        st.divider()
+    
+    # 导出功能（手机可下载）
+    def export_words():
+        content = ""
         for word, desc in words_dict.items():
-            # 一行显示：单词 + 读音按钮 + 音标
-            col_word, col_btn, col_phonetic = st.columns([2, 1, 3])
-            with col_word:
-                st.markdown(f"**{word}**")
-            with col_btn:
-                # 点击按钮播放读音（调用JS）
-                if st.button("🔊 听读音", key=word):
-                    st.components.v1.html(play_pronunciation_js(word), height=0)
-            with col_phonetic:
-                if desc["phonetic"]:
-                    st.markdown(f"/{desc['phonetic']}/")
-                else:
-                    st.markdown("-")
-            
-            # 显示释义和例句
-            st.write(desc["definition"])
-            if desc["example"]:
-                st.caption(desc["example"])
-            st.divider()
-        
-        # 导出功能
-        st.download_button(
-            label="📥 导出单词表到TXT",
-            data=export_words_to_txt(words_dict),
-            file_name="bilibili_video_words.txt",
-            mime="text/plain",
-            use_container_width=True
-        )
+            content += f"{word} {desc['phonetic']}\n{desc['definition']}\n{desc['example']}\n---\n"
+        return content
+    st.download_button(
+        "📥 导出单词表",
+        data=export_words(),
+        file_name="bilibili_words.txt",
+        mime="text/plain",
+        use_container_width=True
+    )
 
 elif submit_btn and not video_url:
     st.warning("请输入B站视频链接！")
 
-# 底部说明
+# 底部说明（手机适配）
 st.divider()
-st.caption("💡 说明：1. 支持B站完整链接和短链接（b23.tv）；2. 首次运行会下载Whisper模型（约1GB）；3. 音频下载和转写可能需要几分钟，请耐心等待；4. 读音功能依赖浏览器语音合成，建议使用Chrome/Edge；5. 翻译功能使用有道免费接口，无需API Key。")
+st.caption("💡 说明：1. 仅支持公开英文视频；2. 转写依赖OpenAI API；3. 手机端建议横屏使用")
