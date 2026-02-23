@@ -1,8 +1,8 @@
 # 核心Web框架
 streamlit>=1.30.0
 
-# B站音频下载
-you-get>=0.4.1822
+# B站音频下载（改用最新可用版本）
+you-get>=0.4.1700
 
 # 语音转文字（OpenAI Whisper）
 openai-whisper>=20231106
@@ -10,9 +10,8 @@ openai-whisper>=20231106
 # HTTP请求（调用词典/翻译API）
 requests>=2.31.0
 
-# 音频处理依赖（Whisper需要）
+# 音频处理依赖
 ffmpeg-python>=0.2.0
 
-# 基础工具库（系统/文件处理）
+# 基础工具库
 pathlib2>=2.3.7.post1
-shutilwhich>=1.1.0
