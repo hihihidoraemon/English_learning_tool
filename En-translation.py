@@ -1,12 +1,13 @@
 import re
 import requests
-import you_get
 import json
 import os
 import whisper
 import streamlit as st
 from pathlib import Path
 import shutil
+import subprocess
+import urllib.parse
 
 # 设置页面配置
 st.set_page_config(
@@ -35,21 +36,63 @@ def clean_audio_dir():
         shutil.rmtree("audio")
     os.makedirs("audio", exist_ok=True)
 
+def resolve_bilibili_short_url(short_url):
+    """解析B站短链接（b23.tv）为完整链接"""
+    try:
+        # 处理b23.tv短链接
+        if "b23.tv" in short_url:
+            # 禁止重定向，获取真实链接
+            response = requests.head(short_url, allow_redirects=True, timeout=10)
+            return response.url
+        return short_url
+    except Exception as e:
+        st.warning(f"解析短链接失败，将尝试直接使用原链接：{str(e)}")
+        return short_url
+
 def download_bilibili_audio(url):
-    """下载B站视频音频"""
+    """下载B站视频音频（优化版：适配短链接+强制指定音频格式）"""
     clean_audio_dir()
     try:
-        # 使用you-get下载仅音频
-        command = f"you-get -o audio --audio-only {url}"
-        os.system(command)
+        # 第一步：解析短链接为完整B站链接
+        full_url = resolve_bilibili_short_url(url)
+        st.info(f"解析后的完整链接：{full_url}")
         
-        # 查找音频文件
-        audio_files = [f for f in os.listdir("audio") if f.endswith(('.mp3', '.m4a', '.wav', '.flac'))]
+        # 第二步：用you-get下载音频（强制指定格式，输出详细日志）
+        # --format 选择音频格式，-v 显示详细日志，方便排查
+        command = f"you-get -o audio --format=flac -v {full_url}"
+        # 执行命令并捕获输出
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=120  # 延长超时时间到2分钟
+        )
+        
+        # 打印日志（方便排查）
+        st.text("下载日志：")
+        st.text(result.stdout)
+        if result.stderr:
+            st.text("下载错误日志：")
+            st.text(result.stderr)
+        
+        # 第三步：查找所有音频文件（扩展格式列表，兼容更多情况）
+        audio_extensions = ('.mp3', '.m4a', '.wav', '.flac', '.ogg', '.aac')
+        audio_files = []
+        # 递归查找audio目录下的所有音频文件（包括子目录）
+        for root, dirs, files in os.walk("audio"):
+            for file in files:
+                if file.lower().endswith(audio_extensions):
+                    audio_files.append(os.path.join(root, file))
+        
         if audio_files:
-            audio_path = os.path.join("audio", audio_files[-1])
+            audio_path = audio_files[-1]  # 取最后一个找到的音频文件
+            st.success(f"成功找到音频文件：{audio_path}")
             return audio_path, None
         else:
-            return None, "未找到音频文件，请检查链接是否有效"
+            return None, "未找到音频文件！可能原因：1.视频无音频 2.you-get未正确下载 3.链接权限问题"
+    except subprocess.TimeoutExpired:
+        return None, "音频下载超时（超过2分钟），请检查网络或视频链接"
     except Exception as e:
         return None, f"下载失败：{str(e)}"
 
@@ -63,22 +106,10 @@ def audio_to_text(audio_path, model_name="base"):
         return None, f"转写失败：{str(e)}"
 
 def translate_text_to_zh(text):
-    """调用免费翻译API将英文翻译成中文（使用DeepL免费接口/备用接口）"""
+    """调用免费翻译API将英文翻译成中文"""
     try:
-        # 方案1：DeepL免费接口（优先）
-        url = "https://api-free.deepl.com/v2/translate"
-        params = {
-            "auth_key": "YOUR_DEEPL_API_KEY",  # 需替换为自己的DeepL免费API Key
-            "text": text,
-            "source_lang": "EN",
-            "target_lang": "ZH"
-        }
-        res = requests.post(url, data=params, timeout=10)
-        if res.status_code == 200:
-            return res.json()["translations"][0]["text"], None
-        
-        # 方案2：备用免费翻译接口（无需API Key）
-        url = f"https://fanyi.youdao.com/translate?&doctype=json&type=EN2ZH_CN&i={text}"
+        # 备用免费翻译接口（无需API Key）
+        url = f"https://fanyi.youdao.com/translate?&doctype=json&type=EN2ZH_CN&i={urllib.parse.quote(text)}"
         res = requests.get(url, timeout=10)
         if res.status_code == 200:
             translations = res.json()["translateResult"][0]
@@ -179,7 +210,7 @@ st.divider()
 # 左侧输入区
 with st.sidebar:
     st.header("输入设置")
-    video_url = st.text_input("B站视频链接", placeholder="例如：https://www.bilibili.com/video/BV1xx411c7mG/")
+    video_url = st.text_input("B站视频链接", placeholder="例如：https://www.bilibili.com/video/BV1xx411c7mG/ 或 b23.tv/TyCfrFJ")
     filter_simple = st.checkbox("过滤简单基础词（a/the/and等）", value=True)
     model_option = st.selectbox("语音识别模型（越大越准）", ["base", "small", "medium"], index=0)
     translate_switch = st.checkbox("翻译视频文本为中文", value=True)  # 翻译开关
@@ -269,4 +300,4 @@ elif submit_btn and not video_url:
 
 # 底部说明
 st.divider()
-st.caption("💡 说明：1. 支持大部分B站公开英文视频；2. 首次运行会下载Whisper模型（约1GB）；3. 音频下载和转写可能需要几分钟，请耐心等待；4. 读音功能依赖浏览器语音合成，建议使用Chrome/Edge；5. 翻译功能优先使用DeepL（需自行申请API Key），备用有道免费接口。")
+st.caption("💡 说明：1. 支持B站完整链接和短链接（b23.tv）；2. 首次运行会下载Whisper模型（约1GB）；3. 音频下载和转写可能需要几分钟，请耐心等待；4. 读音功能依赖浏览器语音合成，建议使用Chrome/Edge；5. 翻译功能使用有道免费接口，无需API Key。")
